@@ -1,0 +1,225 @@
+---
+title: "Time Series Analysis of US New Single Family Home Sales and the Nasdaq-100 Index"
+author: "STAT619 Spring 2021 - Erik Duus"
+output:
+  pdf_document: default
+  html_document: default
+theme: paper
+fontsize: 12pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(astsa)
+library(tseries)
+library(fGarch)
+library(forecast)
+library(lmtest)
+library(tidyverse)
+library(tidyquant)  
+```
+### House Sales - Introduction
+
+FRED New One Family Houses Sold: https://fred.stlouisfed.org/series/HSN1FNSA
+
+Monthly data series NOT seasonally adjusted
+
+Choose a 20 year window for analysis. Use ensuing 7 months for prediction error
+
+```{r}
+# New single family House sales - not seasonally-adjusted
+
+house.df <- read.csv('./HSN1FNSA.csv', header=TRUE)
+house.full_ts <- ts(data=house.df$HSN1FNSA, frequency=12, start=1963 )
+
+# arbitrary 20-year window - avoids the GFC and covid
+house.ts <- window(house.full_ts, start=1982, end=2002) 
+house.future <- window(house.full_ts, start=c(2002,2), end=c(2002,8))
+
+```
+### Exploratory Data Analysis
+Time series shows seasonality and trend - clearly not stationary
+
+1 month differencing to remove trend
+
+12 month differencing to remove seasonality
+
+Resulting time series plot has constant mean and reasonably constant variance
+
+```{r}
+sales <- house.ts
+ds <- diff(house.ts,1)
+dd12s <- diff(ds, 12)
+plot(house.ts, main="New House Sales (1982-2002)", ylab='', xlab='')
+plot(dd12s, main='New House sales (yearly+monthly differencing)', ylab='', xlab='')
+
+plot(cbind(sales, ds, dd12s), main='New House Sales - yearly/seasonal differencing')
+acf2(dd12s, main='ACF: New House Sales (differenced)')
+
+```
+### Statistical Analysis
+stationarity test show no unit root - mean is stationary
+
+model identification: 
+
+* seasonal ACF/PACF at lags: PACF tails off at 2 lags. ACF cuts off at 1 lag. 
+likely MA(2)
+* between season lags: both tail off: ARMA(1,1)
+
+initial model: (1,1,1) / (0,1,2)(12)
+
+* sma2 not significant
+
+next: (1,1,1) / (0,1,1)(12)
+
+* all coefficients significant
+* ljung-box statistics are not significant
+
+parsimonious: 
+
+* (1,1,0) / (0,1,1)(12): bad ljung box
+* (0,1,1) / (0,1,1)(12): bad ljung box
+
+
+
+```{r}
+# null hypothesis not stationary
+adf.test(dd12s, k=0)
+adf.test(dd12s)
+pp.test(dd12s)
+
+# null hypothesis stationary
+kpss.test(dd12s)
+
+sarima(house.ts, 1,1,1, 0,1,2,12)
+sarima(house.ts, 1,1,1, 0,1,1,12) # best
+
+sarima(house.ts, 0, 1, 1, 0,1,1,12)
+sarima(house.ts, 1, 1, 0, 0,1,1,12)
+
+# refit best model using arima() so we can use forecast()
+mod1.fit = arima(house.ts, order=c(1,1,1), seasonal=list(order=c(0,1,1),period=12))
+      
+
+```
+predict 7 months from end of series:
+
+* use true data to compute RMSE
+```{r}
+pred1 = forecast(window(house.ts, start=1992), model=mod1.fit, h=7)
+plot(pred1, main="House Predictions")
+lines(house.future, lty='dashed', col='red')
+legend(1992,95, legend=c('predicted','actual'), col=c('blue', 'red'), lty=1:2)
+
+library(Metrics)
+rmse(house.future, pred1$mean)
+```
+
+
+### Model2: Regression + ARMA errors 
+
+FRED Leading Index for the United States https://fred.stlouisfed.org/series/USSLIND
+
+Build regression model house ~ lead + ARMA errors
+```{r}
+lead.df <- read.csv('./USSLIND.csv', header=TRUE)
+lead.ts <- ts(data=lead.df$USSLIND, frequency=12, start=1982)
+lead.future = window(lead.ts, start=c(2002,2), end=c(2002,8))
+
+```
+### Exploratory Data Analysis
+
+LEAD trend appears to have some correlation with HOUSE
+
+```{r}
+hsle <- ts.intersect(house = house.ts, lead = lead.ts) 
+
+plot(hsle, main='House Sales and Lead Index Sales')
+h <- decompose(hsle[,'house'])
+l <- decompose(hsle[,'lead'])
+htrend <- h$trend
+ltrend <- l$trend
+plot(cbind(htrend,ltrend), main='Trend of House Sales and Lead Index Series',
+     xlab='',ylab=cbind('',''), yaxt='n')
+```
+\
+
+### Statistical Analysis
+
+fit regression house ~ lead
+
+regression of house sales vs leading economic indicators
+
+* coefficients are significant
+
+examine residuals:
+
+* trend and seasonality
+* yearly and monthly difference the series
+* constant mean, constant variance
+
+check for stationarity: all tests pass. mean is stationary
+
+variance is pretty constant
+
+ACF analysis:
+
+* seasonal lags - both seem to cut off at 1. would suggest ARMA(0,0)
+try (1,1)
+
+* between-season lags: tail off ARMA(1,1)
+
+
+```{r}
+summary(mod2.lm <-lm(house ~ lead, data=hsle))
+
+res = resid(mod2.lm)
+dd12res = diff(diff(res,12),1)
+
+layout(matrix(c(1,1,1,1,
+                2,2,2,2),
+              nrow=2, byrow=TRUE))
+plot(res, type="l", main='Residuals', ylab='')
+plot(dd12res, type="l", main='Residuals - differenced', ylab='')
+
+# null hypothesis not stationary
+adf.test(dd12res, k=0)
+adf.test(dd12res)
+pp.test(dd12res)
+
+# null hypothesis stationar
+kpss.test(dd12res)
+
+acf2(dd12res)
+sarima(hsle[,'house'], 1,1,1,0,1,1,12,xreg=hsle[,'lead']) 
+
+
+```
+
+
+```{r}
+mod2.fit = arima(hsle[,'house'],xreg=hsle[,'lead'],order=c(1,1,1), seasonal=list(order=c(0,1,1),period=12)) 
+summary(mod2.fit)
+coeftest(mod2.fit)
+```
+```{r}
+
+
+mod2.fit2 <- Arima(window(hsle[,1], start=1992), 
+                   model=mod2.fit, 
+                   xreg=window(hsle[,2], start=1992))
+
+
+pred2 = forecast(mod2.fit2, xreg=lead.future)
+
+plot(pred2, main="House Sale Predictions - regression+ARMA")
+lines(house.future, lty='dashed', col='red')
+legend(1992,95, legend=c('predicted','actual'), col=c('blue', 'red'), lty=1:2)
+
+rmse(house.future, pred2$mean)
+
+```
+
+
+

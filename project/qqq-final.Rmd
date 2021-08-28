@@ -1,0 +1,226 @@
+---
+title: "STAT619 project Analysis 2 - Nasdaq-100/QQQ Pricing"
+author: "Erik Duus"
+date: "5/5/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+Retrieve data from Yahoo finance: 
+
+* use simple interpolation to approximate missing values.
+* save as a local file so download not required each time
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(astsa)
+library(tseries)
+library(fGarch)
+library(forecast)
+library(lmtest)
+library(tidyverse)
+library(tidyquant)  
+
+```
+```{r}
+options("getSymbols.warning4.0"=FALSE)
+options("getSymbols.yahoo.warning"=FALSE)
+
+# get data from YHOO and save to disk
+
+qqq <- getSymbols("QQQ", auto.assign = FALSE)
+
+# which(is.na(btc$'BTC-USD.Close'))
+qqq <- na.approx(qqq)
+
+#saveRDS(qqq, './qqq.rds')
+
+```
+
+Load local copy of pricing data
+
+* Examine time series; it is growing exponentially
+* Log transform and difference to convert to a returns series
+* Mean looks stationary, variance is not constant
+* Returns show volatility - GARCH may be needed
+* Extract the 2016-2017 window for analysis
+* Plot ACF/PACF of returns and squared returns; squared returns confirm GARCH
+```{r}
+
+# load saved Yahoo data; use adjusted closing prices
+qqqall = readRDS('./qqq.rds')
+qqqall <- qqqall$QQQ.Adjusted
+
+qqqr <- diff(log(qqqall))
+plot(qqqr, main='QQQ daily returns')
+
+
+qqq <- window(qqqall, start='2016-01-01',end='2018-01-01')
+qqqr <- window(qqqr, start='2016-01-01',end='2018-01-01')
+
+layout(matrix(c(1,1,1,1,
+                2,2,2,2),
+              nrow=2, byrow=TRUE))
+
+plot(qqqall, main='QQQ closing price')
+plot(qqqr, main='QQQ daily returns 2016-2017')
+
+acf2(qqqr, main='QQQ returns')
+acf2(qqqr^2, main='QQQ returns squared')
+```
+\ confirm stationarity of mean through unit root tests
+```{r}
+# null hypothesis not stationary
+adf.test(qqqr, k=0)
+adf.test(qqqr)
+pp.test(qqqr)
+
+# null hypothesis stationary
+kpss.test(qqqr)
+```
+
+\
+
+Run auto.arima to see what it suggests;diagnostics of fitted model also show
+variance in residuals, confirming garch.
+
+```{r}
+auto.arima(qqqr, seasonal=FALSE)
+sarima(qqqr, 1,0,0)
+```
+ \
+ 
+ ACF and PACF of series shows a tiny bit of auto-correlation, suggesting 
+ ARMA(1,1)
+ 
+ ACF and PACF of squared series shows both decaying, suggesting GARCH(1,1)
+ 
+ Fit GARCH(1,1) to start as a baseline
+ 
+```{r}
+gf <- garchFit(~garch(1,1), data=qqqr, cond.dist='std', trace=FALSE)
+summary(gf)
+
+layout(matrix(c(1,1,1,1,
+                1,1,1,1,
+                2,2,4,4,
+                2,2,4,4,
+                3,3,4,4,
+                3,3,4,4),nrow=6, byrow=TRUE))
+plot(gf, which=9)
+plot(gf, which=10)
+plot(gf, which=11)
+plot(gf, which=13)
+
+
+```
+\ 
+
+model coefficients are significant, but QQ-plot is not that normal. perhaps 
+ARMA features are required.
+
+several iterations get us to ARMA(5,3)+GARCH(1,1)
+
+** (NOTE ARMA(5,3) is best model but wont predict correctly) **
+```{r}
+gf53 <- garchFit(~arma(5,3)+garch(1,1), data=qqqr ,cond.dist='std', trace=FALSE)
+summary(gf53)
+
+layout(matrix(c(1,1,1,1,
+                1,1,1,1,
+                2,2,4,4,
+                2,2,4,4,
+                3,3,4,4,
+                3,3,4,4),nrow=6, byrow=TRUE))
+plot(gf53, which=9)
+plot(gf53, which=10)
+plot(gf53, which=11)
+plot(gf53, which=13)
+
+
+```
+\ 
+
+QQ plot is much better. residual plot and ACF plots suggest residuals are white noise.
+Ljung-Box tests are also suggestive of white noise residuals.
+
+Conclude this model is accurate and use for predictions.
+
+#### NOTE: fgarch package produces errors on this model when forecasting!
+revert to ARMA(2,2)+GARCH(1,1) for forecast
+
+```{r}
+gf1 <- garchFit(~arma(2,2)+garch(1,1), data=qqqr ,cond.dist='std', trace=FALSE)
+summary(gf1)
+
+layout(matrix(c(1,1,1,1,
+                1,1,1,1,
+                2,2,4,4,
+                2,2,4,4,
+                3,3,4,4,
+                3,3,4,4),nrow=6, byrow=TRUE))
+plot(gf1, which=9)
+plot(gf1, which=10)
+plot(gf1, which=11)
+plot(gf1, which=13)
+
+
+```
+\
+
+predict 14 days of future returns. recall this is a daily returns series, so
+these are predictions of future daily returns.
+
+```{r}
+### 14 day predictions of returns - PLOT
+preds <- predict(gf1, n.ahead=14, plot=TRUE)
+preds
+```
+\ 
+
+to produce pricing predictions the returns series needs to be applied
+to the tail of the price series, and then undifferenced and exp() applied.
+
+
+```{r}
+# convert forecast means and intervals to prices
+mf <- diffinv(preds$meanForecast, xi=log(qqq[503]))
+mf <- mf[2:15] # drop first seed value (from original series)
+li <- mf * (1 + preds$lowerInterval)
+ui <- mf * (1 + preds$upperInterval)
+mf <- exp(mf)
+li <- exp(li)
+ui <- exp(ui)
+
+# get original time series plus the actual values for prediction interval
+# create prediction, upper and lower interval series aligned with actuals
+qqq_true <- window(qqqall, start='2017-07-01',end='2018-01-22')
+qqq_mf <- tail(qqq_true, 14)
+qqq_mf[,1] <- mf
+qqq_li <- tail(qqq_true, 14)
+qqq_li[,1] <- li
+qqq_ui <- tail(qqq_true, 14)
+qqq_ui[,1] <- ui
+
+
+plt <- plot(ylim=c(130,175), qqq_true, type='l', main='QQQ predictions - ARMA(1,1)+GARCH(5,3)', ylab='Price', xlab='')
+plt <- lines(qqq_mf, lty=2, lwd=1, col='blue')
+plt <- lines(qqq_li, lty=4, lwd=1, col='red')
+plt <- lines(qqq_ui, lty=4, lwd=1, col='red')
+plt <- addLegend('topleft', legend.names=c('predicted','lower', 'upper'),
+          lty=c(2,4,4), lwd=c(1,1,1),col=c('blue', 'red', 'red'))
+plt
+
+
+```
+
+\ 
+
+compute RMSE of predictions
+```{r}
+library(Metrics)
+rmse(tail(qqq_true,14), tail(qqq_mf,14))
+```
+
+
